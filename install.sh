@@ -32,7 +32,7 @@ TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 DRY_RUN="${DRY_RUN:-0}"
 # =============================================================================
-# Lock — предотвращает параллельный запуск (одна из причин 500)
+# Lock
 # =============================================================================
 LOCKFILE="/var/run/install_sh.lock"
 acquire_lock(){
@@ -69,7 +69,6 @@ run_cmd(){
 need_root(){ [[ "$(id -u)" -eq 0 ]] || die "Run as root."; }
 detect_os(){
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release"
-  # shellcheck disable=SC1091
   . /etc/os-release
   case "${ID:-}" in debian|ubuntu) : ;; *) die "Unsupported OS: ${ID:-unknown}";; esac
   command -v apt-get >/dev/null 2>&1 || die "apt-get not found"
@@ -123,9 +122,9 @@ gen_password(){
 detect_ip(){
   if [[ -z "${SERVER_IP}" ]]; then
     SERVER_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    [[ -n "$SERVER_IP" ]] && warn "SERVER_IP autodetected as '${SERVER_IP}'. If not public IP, set explicitly."
+    [[ -n "$SERVER_IP" ]] && warn "SERVER_IP autodetected as '${SERVER_IP}'."
   fi
-  [[ -n "${SERVER_IP}" ]] || die "SERVER_IP is empty. Use: bash install.sh wizard"
+  [[ -n "${SERVER_IP}" ]] || die "SERVER_IP is empty."
   log "Using SERVER_IP=${SERVER_IP}"
 }
 # =============================================================================
@@ -198,7 +197,6 @@ load_config_file(){
     config_lint "$CONFIG_FILE" || die "Config still invalid. Fix manually: $CONFIG_FILE"
   fi
   config_autofix_quote_spaces "$CONFIG_FILE"
-  # shellcheck disable=SC1090
   . "$CONFIG_FILE"
 }
 # =============================================================================
@@ -270,6 +268,7 @@ migrate_legacy_exolve(){
   local trunk_list t up proxy_var proxy
   trunk_list="$(normalize_list "${TRUNKS:-}")"; [[ -n "$trunk_list" ]] || return 0
   for t in $trunk_list; do
+    local up proxy
     up="$(upper_sanitize "$t")"; proxy_var="TRUNK_${up}_PROXY"; proxy="$(get_var "$proxy_var")"
     if [[ -z "$proxy" ]]; then
       if [[ -n "${EXOLVE_PROXY:-}" && ( "$t" == "exolve" || "$t" == "${EXOLVE_NAME:-}" ) ]]; then
@@ -285,7 +284,7 @@ migrate_legacy_exolve(){
   done
 }
 # =============================================================================
-# Packages / Asterisk build
+# Packages / Asterisk — APT INSTALL (быстро, ~1-2 мин вместо 15)
 # =============================================================================
 ensure_packages(){
   local pkgs=("$@") missing=() p
@@ -299,58 +298,50 @@ ensure_packages(){
   fi
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
 }
+
+ensure_asterisk_installed(){
+  # ── Быстрая установка через apt ──────────────────────────────────────────
+  # Намного быстрее чем сборка из исходников (1-2 мин vs 15 мин).
+  # Устанавливает Asterisk из официальных репозиториев Ubuntu/Debian.
+  # Для PJSIP нужен пакет asterisk-modules (входит в зависимости).
+  # ─────────────────────────────────────────────────────────────────────────
+  if dpkg -s asterisk >/dev/null 2>&1; then
+    local cur_v
+    cur_v="$(asterisk -V 2>/dev/null | awk '{print $2}' | head -n1 || true)"
+    log "Asterisk уже установлен: ${cur_v}"
+    return 0
+  fi
+
+  log "Устанавливаю Asterisk через apt (быстро)..."
+  is_true "$DRY_RUN" && { log "DRY_RUN: would apt-get install asterisk"; return 0; }
+
+  if [[ "$APT_UPDATED" -eq 0 ]]; then
+    apt-get update -q
+    APT_UPDATED=1
+  fi
+
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    asterisk \
+    asterisk-modules \
+    asterisk-config
+
+  # Убедиться что chan_pjsip и res_pjsip загружаются
+  local modules_conf="/etc/asterisk/modules.conf"
+  if [[ -f "$modules_conf" ]]; then
+    # Убираем noload для pjsip если он там есть
+    sed -i '/noload.*chan_pjsip/d'   "$modules_conf" 2>/dev/null || true
+    sed -i '/noload.*res_pjsip/d'    "$modules_conf" 2>/dev/null || true
+    sed -i '/noload.*res_pjsip_/d'   "$modules_conf" 2>/dev/null || true
+  fi
+
+  CHANGES+=("Installed Asterisk via apt")
+  NEED_ASTERISK_RESTART=1
+  log "Asterisk установлен через apt: $(asterisk -V 2>/dev/null || true)"
+}
+
 asterisk_installed_version(){
   command -v asterisk >/dev/null 2>&1 || { echo ""; return 0; }
   asterisk -V 2>/dev/null | awk '{print $2}' | head -n1 || true
-}
-asterisk_major(){ local v="$1"; [[ -n "$v" ]] || { echo ""; return 0; }; echo "$v" | awk -F. '{print $1}'; }
-ensure_build_deps(){
-  ensure_packages build-essential wget curl ca-certificates pkg-config \
-    libssl-dev libncurses5-dev libncursesw5-dev libxml2-dev uuid-dev libsqlite3-dev \
-    libjansson-dev libedit-dev libcurl4-openssl-dev subversion
-}
-download_asterisk_tarball(){
-  local url="$1" out="$2"; [[ -f "$out" ]] && { log "Tarball exists: $out"; return 0; }
-  log "Downloading: $url"
-  is_true "$DRY_RUN" && { log "DRY_RUN: would download $url -> $out"; return 0; }
-  wget -q --show-progress -O "$out" "$url"
-}
-build_install_asterisk(){
-  local tarball="$1" build_dir="$2"
-  is_true "$DRY_RUN" && { log "DRY_RUN: would build/install Asterisk from $tarball"; return 0; }
-  rm -rf "$build_dir"; mkdir -p "$build_dir"
-  tar xvf "$tarball" -C "$build_dir" --strip-components=1
-  cd "$build_dir"
-  ./configure
-  if [[ -x menuselect/menuselect ]]; then
-    log "Enabling PJSIP modules..."
-    menuselect/menuselect --enable chan_pjsip menuselect.makeopts || true
-    menuselect/menuselect --enable res_pjsip menuselect.makeopts || true
-    menuselect/menuselect --enable res_pjsip_authenticator_digest menuselect.makeopts || true
-    menuselect/menuselect --enable res_pjsip_registrar menuselect.makeopts || true
-    menuselect/menuselect --enable res_pjsip_outbound_registration menuselect.makeopts || true
-  fi
-  make -j"$(nproc)"; make install; ldconfig
-  [[ -f /etc/asterisk/modules.conf ]] || make samples
-}
-ensure_asterisk_installed(){
-  local cur_v cur_major
-  cur_v="$(asterisk_installed_version)"; cur_major="$(asterisk_major "$cur_v")"
-  if [[ -n "$cur_v" && "$cur_major" == "$ASTERISK_VER" ]]; then log "Asterisk already installed: ${cur_v}"; return 0; fi
-  if [[ -n "$cur_v" && "$cur_major" != "$ASTERISK_VER" ]] && ! is_true "$ALLOW_UPGRADE"; then
-    warn "Asterisk is ${cur_v}, ASTERISK_VER=${ASTERISK_VER}, ALLOW_UPGRADE=0 -> skipping rebuild"; return 0
-  fi
-  ensure_build_deps; mkdir -p /usr/src
-  local url tarball build_dir; build_dir="/usr/src/asterisk-${ASTERISK_VER}-build"
-  if [[ -n "$ASTERISK_TARBALL_URL" ]]; then
-    url="$ASTERISK_TARBALL_URL"; tarball="/usr/src/asterisk-${ASTERISK_VER}-custom.tar.gz"
-  else
-    url="https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ASTERISK_VER}-current.tar.gz"
-    tarball="/usr/src/asterisk-${ASTERISK_VER}-current.tar.gz"
-  fi
-  download_asterisk_tarball "$url" "$tarball"
-  build_install_asterisk "$tarball" "$build_dir"
-  CHANGES+=("Installed/updated Asterisk (major ${ASTERISK_VER})"); NEED_ASTERISK_RESTART=1
 }
 # =============================================================================
 # System user/dirs, systemd, firewall, fail2ban
@@ -427,11 +418,9 @@ ensure_ufw_rules(){
         CHANGES+=("UFW allow 5060/udp from ${src}")
       fi
     done
-    warn "TRUSTED_SIP_SOURCES задан — ПК с зарубежного IP НЕ смогут подключиться!"
-    warn "Для работы без VPN: очистите TRUSTED_SIP_SOURCES=\"\" и выполните apply."
   else
     if ! ufw_rule_has "5060/udp"; then
-      log "UFW: allow 5060/udp (любой IP — ПК без VPN)"
+      log "UFW: allow 5060/udp"
       run_cmd "ufw allow 5060/udp >/dev/null"; CHANGES+=("UFW allow 5060/udp (any)")
     fi
   fi
@@ -439,7 +428,6 @@ ensure_ufw_rules(){
 ensure_fail2ban(){
   is_true "$ENABLE_FAIL2BAN" || { log "Skipping fail2ban (ENABLE_FAIL2BAN=0)"; return 0; }
   ensure_packages fail2ban
-
   local jail_file="/etc/fail2ban/jail.d/asterisk-pbx.conf"
   local jail_content="[asterisk]
 enabled  = true
@@ -451,7 +439,6 @@ maxretry = 5
 findtime = 300
 bantime  = 86400
 backend  = auto
-
 [asterisk-tcp]
 enabled  = true
 port     = 5060
@@ -462,24 +449,20 @@ maxretry = 5
 findtime = 300
 bantime  = 86400
 backend  = auto"
-
   if [[ ! -f "$jail_file" ]] || ! grep -q "asterisk-pbx\|asterisk-tcp" "$jail_file" 2>/dev/null; then
     echo "$jail_content" > "$jail_file"
     CHANGES+=("Fail2ban asterisk jail configured")
   fi
-
   local ast_log="/etc/asterisk/logger.conf"
   if [[ -f "$ast_log" ]] && ! grep -q "^messages" "$ast_log"; then
     echo "messages => notice,warning,error" >> "$ast_log"
     NEED_ASTERISK_RESTART=1
     CHANGES+=("Asterisk logger: messages enabled")
   fi
-
   run_cmd "systemctl enable --now fail2ban >/dev/null 2>&1 || true"
   run_cmd "systemctl restart fail2ban >/dev/null 2>&1 || true"
   CHANGES+=("Fail2ban installed/enabled")
 }
-
 # =============================================================================
 # Recording
 # =============================================================================
@@ -498,24 +481,19 @@ ensure_recording(){
     CHANGES+=("Recording cleanup: keep ${RECORDING_DAYS} days")
   fi
   CHANGES+=("Recording enabled: /var/spool/asterisk/monitor/")
-  log "Recording dir: /var/spool/asterisk/monitor/ | Retention: ${RECORDING_DAYS} days"
 }
 # =============================================================================
-# Balance check via AMI
+# Balance check
 # =============================================================================
 ensure_balance_check(){
   is_true "$ENABLE_BALANCE_CHECK" || { log "Skipping balance check (ENABLE_BALANCE_CHECK=0)"; return 0; }
   [[ -n "$TG_TOKEN" && -n "$TG_CHAT_ID" ]] || { log "Skipping balance check (TG_TOKEN/TG_CHAT_ID not set)"; return 0; }
-
   local script_file=/usr/local/bin/asterisk-balance-check.sh
   local cron_file=/etc/cron.d/asterisk-balance-check
-
   local trunk; trunk="$(normalize_list "$TRUNKS" | awk '{print $1}')"
   local up; up="$(upper_sanitize "$trunk")"
   local proxy; proxy="$(get_var "TRUNK_${up}_PROXY")"
-
   local interval="${BALANCE_CHECK_INTERVAL:-5}"
-
   if [[ ! -f "$script_file" ]] || ! grep -q "auto-generated-balance-check" "$script_file" 2>/dev/null; then
     cat > "$script_file" <<SCRIPT
 #!/usr/bin/env bash
@@ -526,10 +504,9 @@ PROXY="${proxy}"
 LABEL="\$(grep ^SERVER_LABEL= /etc/asterisk/install.env 2>/dev/null | cut -d= -f2 || hostname)"
 LOG=/var/log/asterisk/balance-check.log
 ALERT_FILE=/tmp/balance-alert-sent
-
 if tail -n 200 /var/log/asterisk/messages.log 2>/dev/null | grep -qiE "403.*\${PROXY}|503.*\${PROXY}|\${PROXY}.*403|\${PROXY}.*503"; then
   if [[ ! -f "\${ALERT_FILE}" ]] || [[ -n "\$(find "\${ALERT_FILE}" -mmin +60 2>/dev/null)" ]]; then
-    MSG="\$(printf '\xf0\x9f\x92\xb3') <b>Возможно кончился баланс!</b>%0ASервер: <b>\${LABEL}</b>%0AПрокси: <code>\${PROXY}</code>%0AОбнаружен 403/503 — пополните баланс Exolve!"
+    MSG="\$(printf '\xf0\x9f\x92\xb3') <b>Возможно кончился баланс!</b>%0ASервер: <b>\${LABEL}</b>%0AПрокси: <code>\${PROXY}</code>"
     curl -s -X POST "https://api.telegram.org/bot\${TG_TOKEN}/sendMessage" \
       -d "chat_id=\${TG_CHAT_ID}&text=\${MSG}&parse_mode=HTML" >/dev/null 2>&1
     touch "\${ALERT_FILE}"
@@ -542,17 +519,12 @@ SCRIPT
     chmod 0755 "$script_file"
     CHANGES+=("Balance check script: $script_file")
   fi
-
-  local cron_content="# Asterisk balance check every ${interval} minutes
-*/${interval} * * * * root bash ${script_file} 2>/dev/null
+  local cron_content="*/${interval} * * * * root bash ${script_file} 2>/dev/null
 "
   if file_apply_if_changed "$cron_file" "$cron_content" 0644 root:root "Updated balance check cron"; then
     CHANGES+=("Balance check cron: every ${interval} min")
   fi
-
-  log "Balance check: every ${interval} min, alerts via Telegram"
 }
-
 # =============================================================================
 # Asterisk configs
 # =============================================================================
@@ -566,7 +538,6 @@ ensure_trunk_active_conf(){
   local f=/etc/asterisk/trunk_active.conf
   [[ -f "$f" ]] || { run_cmd "touch \"$f\""; CHANGES+=("Created: $f"); }
   if ! grep -q '^\[globals\]' "$f" 2>/dev/null; then
-    warn "$f missing [globals]; prepending."
     if is_true "$DRY_RUN"; then log "DRY_RUN: would prepend [globals] to $f"
     else
       backup_file "$f"
@@ -587,7 +558,6 @@ EOF
   apply_managed_block "$f" "TRUNK_GLOBALS" "$block" ";" && NEED_DIALPLAN_RELOAD=1 || true
   ensure_owner_mode "$f" asterisk:asterisk 0644
 }
-
 ensure_asterisk_configs(){
   local pjsip=/etc/asterisk/pjsip.conf
   local trunks_file=/etc/asterisk/pjsip_trunks.conf
@@ -597,11 +567,8 @@ ensure_asterisk_configs(){
   [[ -f "$trunks_file" ]] || { run_cmd "touch \"$trunks_file\""; CHANGES+=("Created: $trunks_file"); }
   [[ -f "$users_file" ]]  || { run_cmd "touch \"$users_file\"";  CHANGES+=("Created: $users_file"); }
   [[ -f "$exts" ]]        || { run_cmd "touch \"$exts\"";        CHANGES+=("Created: $exts"); }
-
   validate_public_ips
-
   local transports_block=""
-
   transports_block+="[transport-udp-public]"$'\n'
   transports_block+="type=transport"$'\n'
   transports_block+="protocol=udp"$'\n'
@@ -612,7 +579,6 @@ ensure_asterisk_configs(){
   transports_block+="local_net=172.16.0.0/12"$'\n'
   transports_block+="local_net=192.168.0.0/16"$'\n'
   transports_block+=$'\n'
-
   local idx=0 ip tname
   for ip in $PUBLIC_IPS; do
     idx=$((idx+1))
@@ -629,11 +595,9 @@ ensure_asterisk_configs(){
     transports_block+="local_net=192.168.0.0/16"$'\n'
     transports_block+=$'\n'
   done
-
   if apply_managed_block "$pjsip" "TRANSPORTS" "$transports_block" ";"; then
     NEED_PJSIP_RELOAD=1; NEED_ASTERISK_RESTART=1
   fi
-
   local include_block
   include_block="$(cat <<'EOF'
 ; Installer keeps trunks/users in separate files:
@@ -643,11 +607,9 @@ EOF
 )"
   apply_managed_block "$pjsip" "INCLUDES" "$include_block" ";" && NEED_PJSIP_RELOAD=1 || true
   ensure_owner_mode "$pjsip" asterisk:asterisk 0644
-
   local trunk_list user_list
   trunk_list="$(normalize_list "$TRUNKS")"
   user_list="$(normalize_list "$USERS")"
-
   local t
   for t in $trunk_list; do
     local up proxy port matches outcid context bind_ip trunk_transport
@@ -661,7 +623,6 @@ EOF
     is_ipv4 "$bind_ip" || die "TRUNK_${up}_BIND_IP must be IPv4 (got: '$bind_ip')"
     list_contains "$bind_ip" "$PUBLIC_IPS" || die "TRUNK_${up}_BIND_IP='$bind_ip' not in PUBLIC_IPS='$PUBLIC_IPS'"
     [[ -n "$proxy" ]] || die "Missing TRUNK_${up}_PROXY for trunk '${t}'"
-
     trunk_transport="transport-udp-trunk"
     local cidx=0 cur_ip
     for cur_ip in $PUBLIC_IPS; do
@@ -672,27 +633,21 @@ EOF
         break
       fi
     done
-
     local from_user_line=""
     [[ -n "$outcid" ]] && from_user_line="from_user=${outcid}"
-
     local inf identify_block
     inf="$(infer_matches "$proxy" "$matches")"; identify_block=""
     if [[ -n "$inf" ]]; then
       local mlines="" m
       for m in $(normalize_list "$inf"); do mlines+="match=${m}"$'\n'; done
       identify_block="$(cat <<EOF
-
 [${t}-identify]
 type=identify
 endpoint=${t}
 ${mlines%$'\n'}
 EOF
 )"
-    else
-      warn "Trunk '${t}': no identify matches (set TRUNK_${up}_MATCHES)."
     fi
-
     local trunk_block
     trunk_block="$(cat <<EOF
 ; ===== TRUNK: ${t} =====
@@ -713,7 +668,6 @@ direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
-
 [${t}]
 type=aor
 contact=sip:${proxy}:${port}
@@ -724,7 +678,6 @@ EOF
     apply_managed_block "$trunks_file" "TRUNK_${t}" "$trunk_block" ";" && NEED_PJSIP_RELOAD=1 || true
   done
   ensure_owner_mode "$trunks_file" asterisk:asterisk 0644
-
   local u
   for u in $user_list; do
     [[ "$u" =~ ^[0-9]+$ ]] || die "User '${u}' must be numeric extension"
@@ -732,9 +685,8 @@ EOF
     [[ -n "$pass" ]] || die "Missing USER_${u}_PASS for user '${u}'"
     local maxc remove_existing
     maxc="$(get_var "USER_${u}_MAX_CONTACTS")"; [[ -n "$maxc" ]] || maxc="$DEFAULT_MAX_CONTACTS"
-    [[ "$maxc" =~ ^[0-9]+$ ]] || die "USER_${u}_MAX_CONTACTS must be numeric (got: '$maxc')"
+    [[ "$maxc" =~ ^[0-9]+$ ]] || die "USER_${u}_MAX_CONTACTS must be numeric"
     remove_existing="$(get_var "USER_${u}_REMOVE_EXISTING")"; [[ -n "$remove_existing" ]] || remove_existing="$DEFAULT_REMOVE_EXISTING"
-
     local user_block
     user_block="$(cat <<EOF
 ; ===== LOCAL SIP USER ${u} =====
@@ -751,13 +703,11 @@ rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
 direct_media=no
-
 [${u}]
 type=auth
 auth_type=userpass
 username=${u}
 password=${pass}
-
 [${u}]
 type=aor
 max_contacts=${maxc}
@@ -768,7 +718,6 @@ EOF
     apply_managed_block "$users_file" "USER_${u}" "$user_block" ";" && NEED_PJSIP_RELOAD=1 || true
   done
   ensure_owner_mode "$users_file" asterisk:asterisk 0644
-
   local internal_dials=""
   for u in $user_list; do
     internal_dials+="exten => ${u},1,Dial(PJSIP/${u},30)"$'\n'
@@ -932,224 +881,6 @@ save_config_file(){
   if is_true "$DRY_RUN"; then log "DRY_RUN: would chmod 600 ${CONFIG_FILE}"
   else chmod 600 "$CONFIG_FILE" || true; chown root:root "$CONFIG_FILE" || true; fi
 }
-choose_editor(){ [[ -n "${EDITOR:-}" ]] && { echo "$EDITOR"; return; }; command -v nano >/dev/null 2>&1 && { echo nano; return; }; echo vi; }
-cmd_edit(){
-  need_root; detect_os; ensure_config_exists
-  local ed; ed="$(choose_editor)"; run_cmd "$ed \"$CONFIG_FILE\""
-  log "После редактирования: bash install.sh apply"
-}
-prompt_var(){
-  local var="$1" prompt="$2" def="${3:-}"
-  local cur; cur="$(get_var "$var")"; [[ -n "$cur" ]] && def="$cur"
-  local input=""
-  if [[ -n "$def" ]]; then read -rp "${prompt} [${def}]: " input; input="${input:-$def}"
-  else read -rp "${prompt}: " input; fi
-  set_var "$var" "$input"
-}
-cmd_wizard(){
-  need_root; detect_os; load_config_file
-  echo
-  echo "=== install.sh мастер ==="
-  echo "Defaults: proxy=80.75.130.99 port=5060 matches=80.75.130.101"
-  echo
-
-  prompt_var SERVER_IP "SERVER_IP (публичный IP этого VPS)" "$SERVER_IP"
-  detect_ip
-  set_var PUBLIC_IPS "$SERVER_IP"
-  normalize_public_ips
-
-  prompt_var OUTCID "OUTCID (номер, 11 цифр без +)" "$OUTCID"
-
-  prompt_var TRUNKS "Транки (через пробел, напр: exolve)" "$TRUNKS"
-  TRUNKS="$(normalize_list "$TRUNKS")"; [[ -n "$TRUNKS" ]] || die "TRUNKS не может быть пустым"
-  set_var TRUNKS "$TRUNKS"
-
-  echo
-  local t
-  for t in $TRUNKS; do
-    local up; up="$(upper_sanitize "$t")"
-    local cur
-    cur="$(get_var "TRUNK_${up}_PROXY")";   [[ -n "$cur" ]] || set_var "TRUNK_${up}_PROXY"   "80.75.130.99"
-    cur="$(get_var "TRUNK_${up}_PORT")";    [[ -n "$cur" ]] || set_var "TRUNK_${up}_PORT"    "5060"
-    cur="$(get_var "TRUNK_${up}_MATCHES")"; [[ -n "$cur" ]] || set_var "TRUNK_${up}_MATCHES" "80.75.130.101"
-    cur="$(get_var "TRUNK_${up}_OUTCID")";  [[ -n "$cur" ]] || set_var "TRUNK_${up}_OUTCID"  "$OUTCID"
-    cur="$(get_var "TRUNK_${up}_CONTEXT")"; [[ -n "$cur" ]] || set_var "TRUNK_${up}_CONTEXT" "from-${t}"
-    cur="$(get_var "TRUNK_${up}_BIND_IP")"; [[ -n "$cur" ]] || set_var "TRUNK_${up}_BIND_IP" "$SERVER_IP"
-  done
-
-  echo
-  prompt_var USERS "SIP пользователи (через пробел, напр: 1001)" "$USERS"
-  USERS="$(normalize_list "$USERS")"; [[ -n "$USERS" ]] || die "USERS не может быть пустым"
-  set_var USERS "$USERS"
-
-  echo
-  local u
-  for u in $USERS; do
-    [[ "$u" =~ ^[0-9]+$ ]] || die "Пользователь '${u}' должен быть числом"
-    local pass_var="USER_${u}_PASS"
-    local cur_pass; cur_pass="$(get_var "$pass_var")"
-    if [[ -z "$cur_pass" ]]; then
-      cur_pass="$(gen_password)"
-      set_var "$pass_var" "$cur_pass"
-      echo "  ${u}: пароль сгенерирован → ${cur_pass}"
-    else
-      prompt_var "$pass_var" "  ${u}: пароль (Enter = оставить)" "$cur_pass"
-    fi
-    [[ -n "$(get_var "USER_${u}_TRUNK")" ]] || set_var "USER_${u}_TRUNK" "active"
-    [[ -n "$(get_var "USER_${u}_OUTCID")" ]] || set_var "USER_${u}_OUTCID" "$OUTCID"
-  done
-
-  echo
-  prompt_var SSH_PORT "SSH порт (для UFW, Enter = ${SSH_PORT})" "$SSH_PORT"
-
-  set_var ENABLE_UFW "1"
-  set_var TRUSTED_SIP_SOURCES ""
-  set_var ALLOW_UPGRADE "0"
-  set_var ENABLE_FAIL2BAN "1"
-  [[ -n "$(get_var ENABLE_RECORDING)" ]] || set_var ENABLE_RECORDING "1"
-  [[ -n "$(get_var RECORDING_DAYS)" ]] || set_var RECORDING_DAYS "7"
-  set_var DEFAULT_MAX_CONTACTS "1"
-  set_var DEFAULT_REMOVE_EXISTING "yes"
-
-  NEED_SAVE_CONFIG=1; save_config_file
-  echo
-  echo "Готово! Запускайте: bash install.sh apply"
-}
-cmd_list(){
-  need_root; detect_os; load_config_file; normalize_public_ips
-  local trunk_list user_list
-  trunk_list="$(normalize_list "${TRUNKS:-}")"; user_list="$(normalize_list "${USERS:-}")"
-  echo "CONFIG_FILE: $CONFIG_FILE"
-  echo "SERVER_IP: ${SERVER_IP:-}  PUBLIC_IPS: ${PUBLIC_IPS:-}"
-  echo "DEFAULT_MAX_CONTACTS: ${DEFAULT_MAX_CONTACTS:-}  DEFAULT_REMOVE_EXISTING: ${DEFAULT_REMOVE_EXISTING:-}"
-  echo; echo "Транки: ${trunk_list:-(пусто)}"
-  local t
-  for t in $trunk_list; do
-    local up; up="$(upper_sanitize "$t")"
-    echo "  - ${t}: proxy=$(get_var "TRUNK_${up}_PROXY") port=$(get_var "TRUNK_${up}_PORT") bind_ip=$(get_var "TRUNK_${up}_BIND_IP") matches=$(get_var "TRUNK_${up}_MATCHES") outcid=$(get_var "TRUNK_${up}_OUTCID") ctx=$(get_var "TRUNK_${up}_CONTEXT")"
-  done
-  echo; echo "Пользователи: ${user_list:-(пусто)}"
-  local u
-  for u in $user_list; do
-    echo "  - ${u}: trunk=$(get_var "USER_${u}_TRUNK") outcid=$(get_var "USER_${u}_OUTCID") max_contacts=$(get_var "USER_${u}_MAX_CONTACTS") remove_existing=$(get_var "USER_${u}_REMOVE_EXISTING") pass=(скрыт)"
-  done
-}
-cmd_trunk_add(){
-  need_root; detect_os; load_config_file; detect_ip; normalize_public_ips; validate_public_ips
-  local name="${1:-}"
-  [[ -n "$name" ]] || die "Использование: bash install.sh trunk add <n>"
-  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Некорректное имя транка: $name"
-  local up; up="$(upper_sanitize "$name")"
-
-  local proxy port matches outcid
-  proxy="$(get_var "TRUNK_${up}_PROXY")";   [[ -n "$proxy"   ]] || proxy="80.75.130.99"
-  port="$(get_var "TRUNK_${up}_PORT")";     [[ -n "$port"    ]] || port="5060"
-  matches="$(get_var "TRUNK_${up}_MATCHES")"; [[ -n "$matches" ]] || matches="80.75.130.101"
-  outcid="$(get_var "TRUNK_${up}_OUTCID")"; [[ -n "$outcid"  ]] || outcid="$OUTCID"
-
-  echo; echo "Добавление/обновление транка: ${name}"
-  prompt_var "TRUNK_${up}_PROXY"   "  proxy"            "$proxy"
-  prompt_var "TRUNK_${up}_PORT"    "  port"             "$port"
-  prompt_var "TRUNK_${up}_MATCHES" "  identify matches" "$matches"
-  prompt_var "TRUNK_${up}_OUTCID"  "  OUTCID (опц.)"    "$outcid"
-  local cur_ctx; cur_ctx="$(get_var "TRUNK_${up}_CONTEXT")"
-  [[ -n "$cur_ctx" ]] || set_var "TRUNK_${up}_CONTEXT" "from-${name}"
-  local cur_bind; cur_bind="$(get_var "TRUNK_${up}_BIND_IP")"
-  [[ -n "$cur_bind" ]] || set_var "TRUNK_${up}_BIND_IP" "$SERVER_IP"
-
-  TRUNKS="$(normalize_list "${TRUNKS:-}")"
-  if ! list_contains "$name" "$TRUNKS"; then
-    TRUNKS="$(normalize_list "$TRUNKS $name")"; set_var TRUNKS "$TRUNKS"; CHANGES+=("Добавлен транк: ${name}")
-  fi
-
-  NEED_SAVE_CONFIG=1; save_config_file
-  echo; echo "Транк '${name}' сохранён. Дальше: bash install.sh apply"
-}
-cmd_user_add(){
-  need_root; detect_os; load_config_file
-  local ext="${1:-}"
-  [[ -n "$ext" ]] || die "Использование: bash install.sh user add <ext>"
-  [[ "$ext" =~ ^[0-9]+$ ]] || die "extension должен быть числом"
-
-  local pass; pass="$(get_var "USER_${ext}_PASS")"
-  echo; echo "Добавление/обновление SIP-пользователя: ${ext}"
-  if [[ -z "$pass" ]]; then
-    pass="$(gen_password)"
-    set_var "USER_${ext}_PASS" "$pass"
-    echo "  Пароль сгенерирован → ${pass}"
-  else
-    prompt_var "USER_${ext}_PASS" "  Пароль (Enter = оставить)" "$pass"
-  fi
-
-  [[ -n "$(get_var "USER_${ext}_TRUNK")"           ]] || set_var "USER_${ext}_TRUNK"           "active"
-  [[ -n "$(get_var "USER_${ext}_OUTCID")"          ]] || set_var "USER_${ext}_OUTCID"          "$OUTCID"
-  [[ -n "$(get_var "USER_${ext}_MAX_CONTACTS")"    ]] || set_var "USER_${ext}_MAX_CONTACTS"    "$DEFAULT_MAX_CONTACTS"
-  [[ -n "$(get_var "USER_${ext}_REMOVE_EXISTING")" ]] || set_var "USER_${ext}_REMOVE_EXISTING" "$DEFAULT_REMOVE_EXISTING"
-
-  USERS="$(normalize_list "${USERS:-}")"
-  if ! list_contains "$ext" "$USERS"; then
-    USERS="$(normalize_list "$USERS $ext")"; set_var USERS "$USERS"; CHANGES+=("Добавлен пользователь: ${ext}")
-  fi
-
-  NEED_SAVE_CONFIG=1; save_config_file
-  echo
-  echo "Пользователь '${ext}' сохранён."
-  echo "MicroSIP:  Server: ${SERVER_IP:-<SERVER_IP>}  User: ${ext}  Pass: $(get_var "USER_${ext}_PASS")"
-  echo "VPN не нужен — подключается с любого IP."
-  echo; echo "Дальше: bash install.sh apply"
-}
-cmd_user_set_trunk(){
-  need_root; detect_os; load_config_file
-  local ext="${1:-}" tr="${2:-}"
-  [[ -n "$ext" && -n "$tr" ]] || die "Использование: bash install.sh user set-trunk <ext> <active|trunk>"
-  [[ "$ext" =~ ^[0-9]+$ ]] || die "extension должен быть числом"
-  set_var "USER_${ext}_TRUNK" "$tr"; NEED_SAVE_CONFIG=1; CHANGES+=("Транк для ${ext}: ${tr}")
-  save_config_file; echo "Готово. Дальше: bash install.sh apply"
-}
-cmd_user_set_pass(){
-  need_root; detect_os; load_config_file
-  local ext="${1:-}"
-  [[ -n "$ext" ]] || die "Использование: bash install.sh user set-pass <ext>"
-  [[ "$ext" =~ ^[0-9]+$ ]] || die "extension должен быть числом"
-  local pass=""; read -rp "Новый пароль для ${ext}: " pass
-  [[ -n "$pass" ]] || die "Пароль не может быть пустым"
-  set_var "USER_${ext}_PASS" "$pass"; NEED_SAVE_CONFIG=1; CHANGES+=("Сменён пароль для ${ext}")
-  save_config_file; echo "Готово. Дальше: bash install.sh apply"
-}
-cmd_menu(){
-  need_root; detect_os
-  while true; do
-    echo
-    echo "================ install.sh меню ================"
-    echo "1) Мастер (wizard)"
-    echo "2) Применить (apply)"
-    echo "3) Открыть конфиг в редакторе (edit)"
-    echo "4) Показать список (list)"
-    echo "5) Добавить/обновить транк"
-    echo "6) Добавить/обновить SIP-пользователя"
-    echo "7) Назначить транк пользователю"
-    echo "8) Сменить пароль пользователю"
-    echo "9) Переключить активный транк (settrunk)"
-    echo "0) Выход"
-    echo "================================================="
-    read -rp "Выберите пункт: " choice
-    case "${choice:-}" in
-      1) cmd_wizard ;;
-      2) main_apply ;;
-      3) cmd_edit ;;
-      4) cmd_list ;;
-      5) read -rp "Имя транка: " name; cmd_trunk_add "${name:-}" ;;
-      6) read -rp "Extension: " ext; cmd_user_add "${ext:-}" ;;
-      7) read -rp "Extension: " ext; read -rp "Транк: " tr; cmd_user_set_trunk "${ext:-}" "${tr:-}" ;;
-      8) read -rp "Extension: " ext; cmd_user_set_pass "${ext:-}" ;;
-      9)
-        if ! command -v settrunk >/dev/null 2>&1; then warn "settrunk не найден. Сначала: bash install.sh apply"
-        else read -rp "Имя активного транка: " tr; settrunk "${tr:-}" || true; fi ;;
-      0) break ;;
-      *) echo "Неизвестный пункт." ;;
-    esac
-  done
-}
 # =============================================================================
 # Reload/restart + checks
 # =============================================================================
@@ -1188,41 +919,14 @@ print_summary(){
   echo
   echo "============================================================"
   echo "INSTALL/UPDATE COMPLETE"
-  echo
-  echo "SERVER_IP (RU VPS): ${SERVER_IP}"
-  echo
-  echo "Схема работы:"
-  echo "  ПК (любой IP, без VPN)"
-  echo "    └─→ ${SERVER_IP}:5060  [transport-udp-public, bind=0.0.0.0:5060]"
-  echo "         └─→ Exolve       [transport-udp-trunk,  bind=${SERVER_IP}:5061]"
-  echo "  Exolve видит только: ${SERVER_IP} (RU)"
-  echo
-  echo "MicroSIP / SIP-клиент:"
+  echo "SERVER_IP: ${SERVER_IP}"
   local u
   for u in $users; do
-    echo "  Server: ${SERVER_IP}  User: ${u}  Pass: $(get_var "USER_${u}_PASS")"
+    echo "  SIP: Server=${SERVER_IP}  User=${u}  Pass=$(get_var "USER_${u}_PASS")"
   done
-  echo
   echo "Транки: ${trunks}"
-  echo
-  if [[ -n "${TRUSTED_SIP_SOURCES:-}" ]]; then
-    warn "TRUSTED_SIP_SOURCES=${TRUSTED_SIP_SOURCES}"
-    warn "ПК с зарубежного IP ЗАБЛОКИРОВАН UFW! Для работы без VPN: TRUSTED_SIP_SOURCES=\"\""
-  else
-    echo "UFW: порт 5060 открыт для всех — ПК подключается без VPN."
-  fi
-  echo
-  if is_true "$ENABLE_RECORDING"; then
-    echo "Запись разговоров: /var/spool/asterisk/monitor/ (mp3, хранение ${RECORDING_DAYS} дней)"
-    echo "  Просмотр: ls -lh /var/spool/asterisk/monitor/"
-  fi
-  echo "Диагностика:"
-  echo "  asterisk -rx \"pjsip show transports\""
-  echo "  asterisk -rx \"pjsip show contacts\""
-  echo "  journalctl -u asterisk -n 100 --no-pager"
-  echo
-  if [[ "${#CHANGES[@]}" -eq 0 ]]; then echo "Changes: none (idempotent run)."
-  else echo "Changes:"; local c; for c in "${CHANGES[@]}"; do echo "  - ${c}"; done; fi
+  if [[ "${#CHANGES[@]}" -eq 0 ]]; then echo "Changes: none."; else
+    echo "Changes:"; local c; for c in "${CHANGES[@]}"; do echo "  - ${c}"; done; fi
   echo "============================================================"
 }
 validate_inputs(){
@@ -1240,13 +944,12 @@ validate_inputs(){
     [[ "$u" =~ ^[0-9]+$ ]] || die "User '${u}' must be numeric extension"
     local pass_var="USER_${u}_PASS"; local pass; pass="$(get_var "$pass_var")"
     if [[ -z "$pass" ]]; then
-      pass="$(gen_password)"; [[ -n "$pass" ]] || die "Failed to generate password for user ${u}"
-      set_var "$pass_var" "$pass"; CHANGES+=("Generated ${pass_var}"); NEED_SAVE_CONFIG=1
+      pass="$(gen_password)"; set_var "$pass_var" "$pass"; CHANGES+=("Generated ${pass_var}"); NEED_SAVE_CONFIG=1
     fi
     local tvar="USER_${u}_TRUNK"
     [[ -n "$(get_var "$tvar")" ]] || { set_var "$tvar" "active"; NEED_SAVE_CONFIG=1; }
     local mx; mx="$(get_var "USER_${u}_MAX_CONTACTS")"
-    [[ -z "$mx" || "$mx" =~ ^[0-9]+$ ]] || die "USER_${u}_MAX_CONTACTS must be numeric (got '$mx')"
+    [[ -z "$mx" || "$mx" =~ ^[0-9]+$ ]] || die "USER_${u}_MAX_CONTACTS must be numeric"
   done
   local t
   for t in $trunk_list; do
@@ -1254,9 +957,9 @@ validate_inputs(){
     local proxy; proxy="$(get_var "TRUNK_${up}_PROXY")"
     [[ -n "$proxy" ]] || die "Missing TRUNK_${up}_PROXY for trunk '${t}'"
     local bind_ip; bind_ip="$(get_var "TRUNK_${up}_BIND_IP")"
-    [[ -n "$bind_ip" ]] || { set_var "TRUNK_${up}_BIND_IP" "$SERVER_IP"; bind_ip="$SERVER_IP"; NEED_SAVE_CONFIG=1; CHANGES+=("Set TRUNK_${up}_BIND_IP=${SERVER_IP}"); }
-    is_ipv4 "$bind_ip" || die "TRUNK_${up}_BIND_IP must be IPv4 (got '$bind_ip')"
-    list_contains "$bind_ip" "$PUBLIC_IPS" || die "TRUNK_${up}_BIND_IP='$bind_ip' not in PUBLIC_IPS='$PUBLIC_IPS'"
+    [[ -n "$bind_ip" ]] || { set_var "TRUNK_${up}_BIND_IP" "$SERVER_IP"; bind_ip="$SERVER_IP"; NEED_SAVE_CONFIG=1; }
+    is_ipv4 "$bind_ip" || die "TRUNK_${up}_BIND_IP must be IPv4"
+    list_contains "$bind_ip" "$PUBLIC_IPS" || die "TRUNK_${up}_BIND_IP='$bind_ip' not in PUBLIC_IPS"
   done
 }
 main_apply(){
@@ -1266,73 +969,29 @@ main_apply(){
   if [[ "$NEED_SAVE_CONFIG" -eq 1 || ! -f "$CONFIG_FILE" ]]; then save_config_file; fi
   reload_or_restart_if_needed; health_checks; print_summary
 }
-usage(){
-  cat <<EOF
-Использование:
-  bash install.sh menu
-  bash install.sh wizard
-  bash install.sh edit
-  bash install.sh list
-  bash install.sh apply
-  bash install.sh trunk add <n>
-  bash install.sh user add <ext>
-  bash install.sh user set-trunk <ext> <active|trunk>
-  bash install.sh user set-pass <ext>
-  bash install.sh recording on [days]
-  bash install.sh recording off
-EOF
-}
-# =============================================================================
-# ИСПРАВЛЕНО: cmd_recording вынесена в отдельную функцию
-# (в оригинале был баг: \${2:-} с экранированием внутри обычного case,
-#  что вызывало синтаксическую ошибку и exit 1 → HTTP 500)
-# =============================================================================
 cmd_recording(){
   need_root; detect_os; load_config_file
   local subcmd="${1:-}"
   case "$subcmd" in
-    on)
-      set_var ENABLE_RECORDING "1"
-      set_var RECORDING_DAYS "${2:-7}"
-      NEED_SAVE_CONFIG=1; save_config_file
-      echo "Запись включена. Хранение: ${2:-7} дней."
-      echo "Запустите: bash install.sh apply"
-      ;;
-    off)
-      set_var ENABLE_RECORDING "0"
-      NEED_SAVE_CONFIG=1; save_config_file
-      echo "Запись выключена. Запустите: bash install.sh apply"
-      ;;
-    *)
-      echo "Использование: bash install.sh recording on [days] | off"
-      exit 1
-      ;;
+    on)  set_var ENABLE_RECORDING "1"; set_var RECORDING_DAYS "${2:-7}"; NEED_SAVE_CONFIG=1; save_config_file; echo "Запись включена." ;;
+    off) set_var ENABLE_RECORDING "0"; NEED_SAVE_CONFIG=1; save_config_file; echo "Запись выключена." ;;
+    *)   echo "Использование: bash install.sh recording on [days] | off"; exit 1 ;;
   esac
+}
+usage(){
+  cat <<EOF
+Использование:
+  bash install.sh apply
+  bash install.sh recording on [days]
+  bash install.sh recording off
+EOF
 }
 # =============================================================================
 # Entry point
 # =============================================================================
 acquire_lock
 case "${1:-apply}" in
-  menu)      cmd_menu ;;
-  wizard)    cmd_wizard ;;
-  edit)      cmd_edit ;;
-  list)      cmd_list ;;
   apply|"")  main_apply ;;
-  trunk)
-    [[ "${2:-}" == "add" ]] || { usage; exit 1; }
-    cmd_trunk_add "${3:-}"
-    ;;
-  user)
-    case "${2:-}" in
-      add)       cmd_user_add "${3:-}" ;;
-      set-trunk) cmd_user_set_trunk "${3:-}" "${4:-}" ;;
-      set-pass)  cmd_user_set_pass "${3:-}" ;;
-      *)         usage; exit 1 ;;
-    esac
-    ;;
-  recording)
-    cmd_recording "${2:-}" "${3:-}"
-    ;;
+  recording) cmd_recording "${2:-}" "${3:-}" ;;
   *) usage; exit 1 ;;
 esac

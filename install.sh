@@ -31,6 +31,8 @@ BALANCE_CHECK_INTERVAL="${BALANCE_CHECK_INTERVAL:-5}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 DRY_RUN="${DRY_RUN:-0}"
+# Если задан — автоматически настроит proxy-in endpoint для Kamailio прокси
+PROXY_WG_IP="${PROXY_WG_IP:-}"
 # =============================================================================
 # Lock
 # =============================================================================
@@ -334,7 +336,17 @@ ensure_asterisk_installed(){
     sed -i '/noload.*res_pjsip_/d'   "$modules_conf" 2>/dev/null || true
   fi
 
+  # ── Отключить chan_sip — ОБЯЗАТЕЛЬНО для работы PJSIP ──────────────────────
+  # chan_sip перехватывает UDP пакеты и мешает res_pjsip обрабатывать входящие.
+  # Физическое удаление .so файла — единственный надёжный способ.
+  local chan_sip_so="/usr/lib/x86_64-linux-gnu/asterisk/modules/chan_sip.so"
+  if [[ -f "$chan_sip_so" ]]; then
+    mv "$chan_sip_so" "${chan_sip_so}.disabled"
+    log "chan_sip.so отключён (переименован в .disabled)"
+  fi
+
   CHANGES+=("Installed Asterisk via apt")
+  CHANGES+=("Disabled chan_sip.so")
   NEED_ASTERISK_RESTART=1
   log "Asterisk установлен через apt: $(asterisk -V 2>/dev/null || true)"
 }
@@ -962,10 +974,79 @@ validate_inputs(){
     list_contains "$bind_ip" "$PUBLIC_IPS" || die "TRUNK_${up}_BIND_IP='$bind_ip' not in PUBLIC_IPS"
   done
 }
+# =============================================================================
+# Настройка proxy-in endpoint для Kamailio прокси (если PROXY_WG_IP задан)
+# =============================================================================
+ensure_proxy_config(){
+  [[ -n "${PROXY_WG_IP:-}" ]] || return 0
+  log "Настраиваю proxy-in endpoint для Kamailio прокси (${PROXY_WG_IP})..."
+
+  local users_file="/etc/asterisk/pjsip_users.conf"
+  local exts_file="/etc/asterisk/extensions.conf"
+
+  # Добавить proxy-in endpoint если нет
+  if ! grep -q "^\[proxy-in\]" "$users_file" 2>/dev/null; then
+    cat >> "$users_file" << EOF
+
+; ===== KAMAILIO PROXY =====
+[proxy-in]
+type=endpoint
+transport=transport-udp-public
+context=from-proxy
+disallow=all
+allow=ulaw
+allow=alaw
+aors=proxy-in
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+identify_by=ip
+
+[proxy-in]
+type=aor
+contact=sip:${PROXY_WG_IP}:5060
+qualify_frequency=0
+
+[proxy-in-identify]
+type=identify
+endpoint=proxy-in
+match=${PROXY_WG_IP}
+EOF
+    CHANGES+=("Added proxy-in endpoint for ${PROXY_WG_IP}")
+    NEED_PJSIP_RELOAD=1
+  else
+    log "proxy-in endpoint уже существует"
+  fi
+
+  # Добавить from-proxy диалплан если нет
+  if ! grep -q "^\[from-proxy\]" "$exts_file" 2>/dev/null; then
+    local trunk; trunk="$(normalize_list "$TRUNKS" | awk '{print $1}')"
+    cat >> "$exts_file" << EOF
+
+[from-proxy]
+exten => _7XXXXXXXXXX,1,NoOp(Kamailio proxy: \${EXTEN})
+ same => n,Dial(PJSIP/\${EXTEN}@${trunk},60)
+ same => n,Hangup()
+exten => _8XXXXXXXXXX,1,Goto(from-proxy,7\${EXTEN:1},1)
+exten => _+7XXXXXXXXXX,1,Goto(from-proxy,7\${EXTEN:2},1)
+exten => _9XXXXXXXXX,1,Goto(from-proxy,7\${EXTEN},1)
+EOF
+    CHANGES+=("Added from-proxy dialplan context")
+    NEED_DIALPLAN_RELOAD=1
+  else
+    log "from-proxy диалплан уже существует"
+  fi
+
+  ensure_owner_mode "$users_file" asterisk:asterisk 0644
+  ensure_owner_mode "$exts_file"  asterisk:asterisk 0644
+}
+
 main_apply(){
   need_root; detect_os; load_config_file; migrate_legacy_exolve; validate_inputs
   ensure_asterisk_installed; ensure_user_and_dirs; ensure_systemd_unit
   ensure_ufw_rules; ensure_asterisk_configs; ensure_tools; ensure_fail2ban; ensure_recording; ensure_balance_check
+  ensure_proxy_config
   if [[ "$NEED_SAVE_CONFIG" -eq 1 || ! -f "$CONFIG_FILE" ]]; then save_config_file; fi
   reload_or_restart_if_needed; health_checks; print_summary
 }

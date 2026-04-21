@@ -969,181 +969,6 @@ main_apply(){
   if [[ "$NEED_SAVE_CONFIG" -eq 1 || ! -f "$CONFIG_FILE" ]]; then save_config_file; fi
   reload_or_restart_if_needed; health_checks; print_summary
 }
-choose_editor(){ [[ -n "${EDITOR:-}" ]] && { echo "$EDITOR"; return; }; command -v nano >/dev/null 2>&1 && { echo nano; return; }; echo vi; }
-cmd_edit(){
-  need_root; detect_os; ensure_config_exists
-  local ed; ed="$(choose_editor)"; run_cmd "$ed "$CONFIG_FILE""
-  log "После редактирования: bash install.sh apply"
-}
-prompt_var(){
-  local var="$1" prompt="$2" def="${3:-}"
-  local cur; cur="$(get_var "$var")"; [[ -n "$cur" ]] && def="$cur"
-  local input=""
-  if [[ -n "$def" ]]; then read -rp "${prompt} [${def}]: " input; input="${input:-$def}"
-  else read -rp "${prompt}: " input; fi
-  set_var "$var" "$input"
-}
-cmd_wizard(){
-  need_root; detect_os; load_config_file
-  echo; echo "=== install.sh мастер ==="
-  prompt_var SERVER_IP "SERVER_IP (публичный IP этого VPS)" "$SERVER_IP"
-  detect_ip; set_var PUBLIC_IPS "$SERVER_IP"; normalize_public_ips
-  prompt_var OUTCID "OUTCID (номер, 11 цифр без +)" "$OUTCID"
-  prompt_var TRUNKS "Транки (через пробел, напр: exolve)" "$TRUNKS"
-  TRUNKS="$(normalize_list "$TRUNKS")"; [[ -n "$TRUNKS" ]] || die "TRUNKS не может быть пустым"
-  set_var TRUNKS "$TRUNKS"
-  local t
-  for t in $TRUNKS; do
-    local up; up="$(upper_sanitize "$t")"
-    local cur
-    cur="$(get_var "TRUNK_${up}_PROXY")";   [[ -n "$cur" ]] || set_var "TRUNK_${up}_PROXY"   "80.75.130.99"
-    cur="$(get_var "TRUNK_${up}_PORT")";    [[ -n "$cur" ]] || set_var "TRUNK_${up}_PORT"    "5060"
-    cur="$(get_var "TRUNK_${up}_MATCHES")"; [[ -n "$cur" ]] || set_var "TRUNK_${up}_MATCHES" "80.75.130.101"
-    cur="$(get_var "TRUNK_${up}_OUTCID")";  [[ -n "$cur" ]] || set_var "TRUNK_${up}_OUTCID"  "$OUTCID"
-    cur="$(get_var "TRUNK_${up}_CONTEXT")"; [[ -n "$cur" ]] || set_var "TRUNK_${up}_CONTEXT" "from-${t}"
-    cur="$(get_var "TRUNK_${up}_BIND_IP")"; [[ -n "$cur" ]] || set_var "TRUNK_${up}_BIND_IP" "$SERVER_IP"
-  done
-  prompt_var USERS "SIP пользователи (через пробел, напр: 1001)" "$USERS"
-  USERS="$(normalize_list "$USERS")"; [[ -n "$USERS" ]] || die "USERS не может быть пустым"
-  set_var USERS "$USERS"
-  local u
-  for u in $USERS; do
-    [[ "$u" =~ ^[0-9]+$ ]] || die "Пользователь '${u}' должен быть числом"
-    local pass_var="USER_${u}_PASS"
-    local cur_pass; cur_pass="$(get_var "$pass_var")"
-    if [[ -z "$cur_pass" ]]; then
-      cur_pass="$(gen_password)"; set_var "$pass_var" "$cur_pass"
-      echo "  ${u}: пароль сгенерирован → ${cur_pass}"
-    else
-      prompt_var "$pass_var" "  ${u}: пароль (Enter = оставить)" "$cur_pass"
-    fi
-    [[ -n "$(get_var "USER_${u}_TRUNK")" ]] || set_var "USER_${u}_TRUNK" "active"
-    [[ -n "$(get_var "USER_${u}_OUTCID")" ]] || set_var "USER_${u}_OUTCID" "$OUTCID"
-  done
-  prompt_var SSH_PORT "SSH порт (для UFW)" "$SSH_PORT"
-  set_var ENABLE_UFW "1"; set_var TRUSTED_SIP_SOURCES ""; set_var ALLOW_UPGRADE "0"
-  set_var ENABLE_FAIL2BAN "1"; set_var DEFAULT_MAX_CONTACTS "1"; set_var DEFAULT_REMOVE_EXISTING "yes"
-  [[ -n "$(get_var ENABLE_RECORDING)" ]] || set_var ENABLE_RECORDING "1"
-  [[ -n "$(get_var RECORDING_DAYS)" ]] || set_var RECORDING_DAYS "7"
-  NEED_SAVE_CONFIG=1; save_config_file
-  echo; echo "Готово! Запускайте: bash install.sh apply"
-}
-cmd_list(){
-  need_root; detect_os; load_config_file; normalize_public_ips
-  local trunk_list user_list
-  trunk_list="$(normalize_list "${TRUNKS:-}")"; user_list="$(normalize_list "${USERS:-}")"
-  echo "SERVER_IP: ${SERVER_IP:-}  PUBLIC_IPS: ${PUBLIC_IPS:-}"
-  echo; echo "Транки: ${trunk_list:-(пусто)}"
-  local t
-  for t in $trunk_list; do
-    local up; up="$(upper_sanitize "$t")"
-    echo "  - ${t}: proxy=$(get_var "TRUNK_${up}_PROXY") port=$(get_var "TRUNK_${up}_PORT") outcid=$(get_var "TRUNK_${up}_OUTCID")"
-  done
-  echo; echo "Пользователи: ${user_list:-(пусто)}"
-  local u
-  for u in $user_list; do
-    echo "  - ${u}: trunk=$(get_var "USER_${u}_TRUNK") outcid=$(get_var "USER_${u}_OUTCID") pass=(скрыт)"
-  done
-}
-cmd_trunk_add(){
-  need_root; detect_os; load_config_file; detect_ip; normalize_public_ips; validate_public_ips
-  local name="${1:-}"
-  [[ -n "$name" ]] || die "Использование: bash install.sh trunk add <name>"
-  local up; up="$(upper_sanitize "$name")"
-  local proxy port matches outcid
-  proxy="$(get_var "TRUNK_${up}_PROXY")";   [[ -n "$proxy"   ]] || proxy="80.75.130.99"
-  port="$(get_var "TRUNK_${up}_PORT")";     [[ -n "$port"    ]] || port="5060"
-  matches="$(get_var "TRUNK_${up}_MATCHES")"; [[ -n "$matches" ]] || matches="80.75.130.101"
-  outcid="$(get_var "TRUNK_${up}_OUTCID")"; [[ -n "$outcid"  ]] || outcid="$OUTCID"
-  echo; echo "Добавление/обновление транка: ${name}"
-  prompt_var "TRUNK_${up}_PROXY"   "  proxy"            "$proxy"
-  prompt_var "TRUNK_${up}_PORT"    "  port"             "$port"
-  prompt_var "TRUNK_${up}_MATCHES" "  identify matches" "$matches"
-  prompt_var "TRUNK_${up}_OUTCID"  "  OUTCID (опц.)"    "$outcid"
-  local cur_ctx; cur_ctx="$(get_var "TRUNK_${up}_CONTEXT")"
-  [[ -n "$cur_ctx" ]] || set_var "TRUNK_${up}_CONTEXT" "from-${name}"
-  local cur_bind; cur_bind="$(get_var "TRUNK_${up}_BIND_IP")"
-  [[ -n "$cur_bind" ]] || set_var "TRUNK_${up}_BIND_IP" "$SERVER_IP"
-  TRUNKS="$(normalize_list "${TRUNKS:-}")"
-  if ! list_contains "$name" "$TRUNKS"; then
-    TRUNKS="$(normalize_list "$TRUNKS $name")"; set_var TRUNKS "$TRUNKS"
-  fi
-  NEED_SAVE_CONFIG=1; save_config_file
-  echo; echo "Транк '${name}' сохранён. Дальше: bash install.sh apply"
-}
-cmd_user_add(){
-  need_root; detect_os; load_config_file
-  local ext="${1:-}"
-  [[ -n "$ext" ]] || die "Использование: bash install.sh user add <ext>"
-  [[ "$ext" =~ ^[0-9]+$ ]] || die "extension должен быть числом"
-  local pass; pass="$(get_var "USER_${ext}_PASS")"
-  echo; echo "Добавление/обновление SIP-пользователя: ${ext}"
-  if [[ -z "$pass" ]]; then
-    pass="$(gen_password)"; set_var "USER_${ext}_PASS" "$pass"
-    echo "  Пароль сгенерирован → ${pass}"
-  else
-    prompt_var "USER_${ext}_PASS" "  Пароль (Enter = оставить)" "$pass"
-  fi
-  [[ -n "$(get_var "USER_${ext}_TRUNK")"           ]] || set_var "USER_${ext}_TRUNK"           "active"
-  [[ -n "$(get_var "USER_${ext}_OUTCID")"          ]] || set_var "USER_${ext}_OUTCID"          "$OUTCID"
-  [[ -n "$(get_var "USER_${ext}_MAX_CONTACTS")"    ]] || set_var "USER_${ext}_MAX_CONTACTS"    "$DEFAULT_MAX_CONTACTS"
-  [[ -n "$(get_var "USER_${ext}_REMOVE_EXISTING")" ]] || set_var "USER_${ext}_REMOVE_EXISTING" "$DEFAULT_REMOVE_EXISTING"
-  USERS="$(normalize_list "${USERS:-}")"
-  if ! list_contains "$ext" "$USERS"; then
-    USERS="$(normalize_list "$USERS $ext")"; set_var USERS "$USERS"
-  fi
-  NEED_SAVE_CONFIG=1; save_config_file
-  echo; echo "Пользователь '${ext}' сохранён."
-  echo "MicroSIP: Server=${SERVER_IP:-<SERVER_IP>} User=${ext} Pass=$(get_var "USER_${ext}_PASS")"
-  echo; echo "Дальше: bash install.sh apply"
-}
-cmd_user_set_pass(){
-  need_root; detect_os; load_config_file
-  local ext="${1:-}"
-  [[ -n "$ext" ]] || die "Использование: bash install.sh user set-pass <ext>"
-  [[ "$ext" =~ ^[0-9]+$ ]] || die "extension должен быть числом"
-  local pass=""; read -rp "Новый пароль для ${ext}: " pass
-  [[ -n "$pass" ]] || die "Пароль не может быть пустым"
-  set_var "USER_${ext}_PASS" "$pass"; NEED_SAVE_CONFIG=1
-  save_config_file; echo "Готово. Дальше: bash install.sh apply"
-}
-cmd_user_set_trunk(){
-  need_root; detect_os; load_config_file
-  local ext="${1:-}" tr="${2:-}"
-  [[ -n "$ext" && -n "$tr" ]] || die "Использование: bash install.sh user set-trunk <ext> <trunk>"
-  set_var "USER_${ext}_TRUNK" "$tr"; NEED_SAVE_CONFIG=1
-  save_config_file; echo "Готово. Дальше: bash install.sh apply"
-}
-cmd_menu(){
-  need_root; detect_os
-  while true; do
-    echo
-    echo "================ install.sh меню ================"
-    echo "1) Мастер (wizard)"
-    echo "2) Применить (apply)"
-    echo "3) Открыть конфиг в редакторе (edit)"
-    echo "4) Показать список (list)"
-    echo "5) Добавить/обновить транк"
-    echo "6) Добавить/обновить SIP-пользователя"
-    echo "7) Назначить транк пользователю"
-    echo "8) Сменить пароль пользователю"
-    echo "0) Выход"
-    echo "================================================="
-    read -rp "Выберите пункт: " choice
-    case "${choice:-}" in
-      1) cmd_wizard ;;
-      2) main_apply ;;
-      3) cmd_edit ;;
-      4) cmd_list ;;
-      5) read -rp "Имя транка: " name; cmd_trunk_add "${name:-}" ;;
-      6) read -rp "Extension: " ext; cmd_user_add "${ext:-}" ;;
-      7) read -rp "Extension: " ext; read -rp "Транк: " tr; cmd_user_set_trunk "${ext:-}" "${tr:-}" ;;
-      8) read -rp "Extension: " ext; cmd_user_set_pass "${ext:-}" ;;
-      0) break ;;
-      *) echo "Неизвестный пункт." ;;
-    esac
-  done
-}
 cmd_recording(){
   need_root; detect_os; load_config_file
   local subcmd="${1:-}"
@@ -1156,15 +981,7 @@ cmd_recording(){
 usage(){
   cat <<EOF
 Использование:
-  bash install.sh menu
-  bash install.sh wizard
-  bash install.sh edit
-  bash install.sh list
   bash install.sh apply
-  bash install.sh trunk add <name>
-  bash install.sh user add <ext>
-  bash install.sh user set-trunk <ext> <trunk>
-  bash install.sh user set-pass <ext>
   bash install.sh recording on [days]
   bash install.sh recording off
 EOF
@@ -1174,23 +991,7 @@ EOF
 # =============================================================================
 acquire_lock
 case "${1:-apply}" in
-  menu)      cmd_menu ;;
-  wizard)    cmd_wizard ;;
-  edit)      cmd_edit ;;
-  list)      cmd_list ;;
   apply|"")  main_apply ;;
-  trunk)
-    [[ "${2:-}" == "add" ]] || { usage; exit 1; }
-    cmd_trunk_add "${3:-}"
-    ;;
-  user)
-    case "${2:-}" in
-      add)       cmd_user_add "${3:-}" ;;
-      set-trunk) cmd_user_set_trunk "${3:-}" "${4:-}" ;;
-      set-pass)  cmd_user_set_pass "${3:-}" ;;
-      *)         usage; exit 1 ;;
-    esac
-    ;;
   recording) cmd_recording "${2:-}" "${3:-}" ;;
   *) usage; exit 1 ;;
 esac

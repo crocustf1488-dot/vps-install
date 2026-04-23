@@ -365,6 +365,27 @@ ensure_user_and_dirs(){
   ensure_owner_mode /var/run/asterisk         asterisk:asterisk 0755
   ensure_owner_mode /etc/asterisk             asterisk:asterisk 0755
 }
+# =============================================================================
+# Logger
+# =============================================================================
+ensure_logger(){
+  local ast_log="/etc/asterisk/logger.conf"
+  [[ -f "$ast_log" ]] || return 0
+  local changed=0
+  if ! grep -q "^full" "$ast_log"; then
+    is_true "$DRY_RUN" || echo "full => notice,warning,error,verbose,debug,dtmf" >> "$ast_log"
+    changed=1
+  fi
+  if ! grep -q "^messages" "$ast_log"; then
+    is_true "$DRY_RUN" || echo "messages => notice,warning,error" >> "$ast_log"
+    changed=1
+  fi
+  if [[ "$changed" -eq 1 ]]; then
+    run_cmd "asterisk -rx 'logger reload' >/dev/null 2>&1 || true"
+    CHANGES+=("Asterisk logger: full+messages enabled")
+  fi
+}
+
 ensure_systemd_unit(){
   local unit=/etc/systemd/system/asterisk.service
   local content
@@ -708,7 +729,6 @@ disallow=all
 allow=ulaw
 allow=alaw
 aors=${t}
-outbound_proxy=sip:${proxy}:${port}\;lr
 from_domain=${proxy}
 ${from_user_line}
 send_pai=yes
@@ -816,7 +836,7 @@ EOF
     per_user_contexts+="exten => _7XXXXXXXXXX,1,NoOp(Outgoing via ${noop_trunk} for ${u})"$'\n'
     per_user_contexts+="${cid_set}"
     if is_true "$ENABLE_RECORDING"; then
-      per_user_contexts+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-out-${u}.wav,b,/usr/bin/lame -b 64 \${MONITOR_FILENAME} \${MONITOR_FILENAME:0:-4}.mp3 && rm -f \${MONITOR_FILENAME})"$'\n'
+      per_user_contexts+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-out-${u}.wav,,/usr/bin/lame -b 64 ^{MONITOR_FILENAME} ^{MONITOR_FILENAME:0:-4}.mp3 && rm -f ^{MONITOR_FILENAME})"$'\n'
     fi
     per_user_contexts+=" same => n,Dial(${dial_target},${DIAL_TIMEOUT})"$'\n'
     # ИСПРАВЛЕНИЕ: обработка всех возможных статусов после Dial
@@ -841,7 +861,7 @@ EOF
     incoming_ctxs+=$'\n'"[${ctx}]"$'\n'
     incoming_ctxs+="exten => _X.,1,NoOp(Incoming from trunk ${t})"$'\n'
     if is_true "$ENABLE_RECORDING"; then
-      incoming_ctxs+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-in.wav,b,/usr/bin/lame -b 64 \${MONITOR_FILENAME} \${MONITOR_FILENAME:0:-4}.mp3 && rm -f \${MONITOR_FILENAME})"$'\n'
+      incoming_ctxs+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-in.wav,,/usr/bin/lame -b 64 ^{MONITOR_FILENAME} ^{MONITOR_FILENAME:0:-4}.mp3 && rm -f ^{MONITOR_FILENAME})"$'\n'
     fi
     # ИСПРАВЛЕНИЕ: входящий — тоже с обработкой статуса
     incoming_ctxs+=" same => n,Dial(PJSIP/${first_user},${DIAL_TIMEOUT})"$'\n'
@@ -1061,7 +1081,7 @@ validate_inputs(){
 main_apply(){
   need_root; detect_os; load_config_file; migrate_legacy_exolve; validate_inputs
   ensure_asterisk_installed; ensure_user_and_dirs; ensure_systemd_unit
-  ensure_ufw_rules; ensure_asterisk_configs; ensure_tools; ensure_fail2ban; ensure_recording; ensure_balance_check
+  ensure_logger; ensure_ufw_rules; ensure_asterisk_configs; ensure_tools; ensure_fail2ban; ensure_recording; ensure_balance_check
   if [[ "$NEED_SAVE_CONFIG" -eq 1 || ! -f "$CONFIG_FILE" ]]; then save_config_file; fi
   reload_or_restart_if_needed; health_checks; print_summary
 }

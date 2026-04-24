@@ -3,24 +3,14 @@ set -euo pipefail
 # =============================================================================
 # install.sh — idempotent Asterisk/PJSIP installer + RU menu + users/trunks manager
 # Config: /etc/asterisk/install.env (managed block)
-#
-# FIXES vs previous version:
-#   - DEFAULT_MAX_CONTACTS=2, DEFAULT_REMOVE_EXISTING=no  → 2 устройства на аккаунт
-#   - Dial() использует LOCAL_TIMEOUT + обработку DIALSTATUS  → нет 500
-#   - pjsip.conf: rtp_timeout=60 → зависшие каналы сами падают
-#   - fail2ban: ignoreip включает SERVER_IP + TRUSTED_SIP_SOURCES
-#   - fail2ban: jail.d/asterisk-pbx.conf защищает и 5061 (транковый порт)
-#   - Исходящий Dial: проверка статуса + Congestion вместо тихого обрыва
-#   - Новый параметр DIAL_TIMEOUT (default 60) — единое место для таймаута
 # =============================================================================
 ASTERISK_VER="${ASTERISK_VER:-21}"
 ASTERISK_TARBALL_URL="${ASTERISK_TARBALL_URL:-}"
 ALLOW_UPGRADE="${ALLOW_UPGRADE:-0}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/asterisk/install.env}"
 SERVER_IP="${SERVER_IP:-}"
-# ИСПРАВЛЕНИЕ: 2 контакта по умолчанию + не выбивать старые регистрации
-DEFAULT_MAX_CONTACTS="${DEFAULT_MAX_CONTACTS:-2}"
-DEFAULT_REMOVE_EXISTING="${DEFAULT_REMOVE_EXISTING:-no}"
+DEFAULT_MAX_CONTACTS="${DEFAULT_MAX_CONTACTS:-1}"
+DEFAULT_REMOVE_EXISTING="${DEFAULT_REMOVE_EXISTING:-yes}"
 PUBLIC_IPS="${PUBLIC_IPS:-}"
 USERS="${USERS:-1001}"
 TRUNKS="${TRUNKS:-exolve}"
@@ -41,8 +31,6 @@ BALANCE_CHECK_INTERVAL="${BALANCE_CHECK_INTERVAL:-5}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 DRY_RUN="${DRY_RUN:-0}"
-# ИСПРАВЛЕНИЕ: таймаут Dial вынесен в одну переменную
-DIAL_TIMEOUT="${DIAL_TIMEOUT:-60}"
 # =============================================================================
 # Lock
 # =============================================================================
@@ -296,7 +284,7 @@ migrate_legacy_exolve(){
   done
 }
 # =============================================================================
-# Packages / Asterisk — APT INSTALL
+# Packages / Asterisk — APT INSTALL (быстро, ~1-2 мин вместо 15)
 # =============================================================================
 ensure_packages(){
   local pkgs=("$@") missing=() p
@@ -312,6 +300,11 @@ ensure_packages(){
 }
 
 ensure_asterisk_installed(){
+  # ── Быстрая установка через apt ──────────────────────────────────────────
+  # Намного быстрее чем сборка из исходников (1-2 мин vs 15 мин).
+  # Устанавливает Asterisk из официальных репозиториев Ubuntu/Debian.
+  # Для PJSIP нужен пакет asterisk-modules (входит в зависимости).
+  # ─────────────────────────────────────────────────────────────────────────
   if dpkg -s asterisk >/dev/null 2>&1; then
     local cur_v
     cur_v="$(asterisk -V 2>/dev/null | awk '{print $2}' | head -n1 || true)"
@@ -332,8 +325,10 @@ ensure_asterisk_installed(){
     asterisk-modules \
     asterisk-config
 
+  # Убедиться что chan_pjsip и res_pjsip загружаются
   local modules_conf="/etc/asterisk/modules.conf"
   if [[ -f "$modules_conf" ]]; then
+    # Убираем noload для pjsip если он там есть
     sed -i '/noload.*chan_pjsip/d'   "$modules_conf" 2>/dev/null || true
     sed -i '/noload.*res_pjsip/d'    "$modules_conf" 2>/dev/null || true
     sed -i '/noload.*res_pjsip_/d'   "$modules_conf" 2>/dev/null || true
@@ -365,27 +360,6 @@ ensure_user_and_dirs(){
   ensure_owner_mode /var/run/asterisk         asterisk:asterisk 0755
   ensure_owner_mode /etc/asterisk             asterisk:asterisk 0755
 }
-# =============================================================================
-# Logger
-# =============================================================================
-ensure_logger(){
-  local ast_log="/etc/asterisk/logger.conf"
-  [[ -f "$ast_log" ]] || return 0
-  local changed=0
-  if ! grep -q "^full" "$ast_log"; then
-    is_true "$DRY_RUN" || echo "full => notice,warning,error,verbose,debug,dtmf" >> "$ast_log"
-    changed=1
-  fi
-  if ! grep -q "^messages" "$ast_log"; then
-    is_true "$DRY_RUN" || echo "messages => notice,warning,error" >> "$ast_log"
-    changed=1
-  fi
-  if [[ "$changed" -eq 1 ]]; then
-    run_cmd "asterisk -rx 'logger reload' >/dev/null 2>&1 || true"
-    CHANGES+=("Asterisk logger: full+messages enabled")
-  fi
-}
-
 ensure_systemd_unit(){
   local unit=/etc/systemd/system/asterisk.service
   local content
@@ -425,7 +399,6 @@ ensure_ufw_rules(){
     log "UFW: allow ${SSH_PORT}/tcp"
     run_cmd "ufw allow ${SSH_PORT}/tcp >/dev/null"; CHANGES+=("UFW allow ${SSH_PORT}/tcp")
   fi
-  # ИСПРАВЛЕНИЕ: добавляем 5061/udp для транкового транспорта
   if ! ufw_rule_has "5061/udp"; then
     log "UFW: allow 5061/udp (trunk transport)"
     run_cmd "ufw allow 5061/udp >/dev/null"; CHANGES+=("UFW allow 5061/udp (trunk)")
@@ -452,37 +425,13 @@ ensure_ufw_rules(){
     fi
   fi
 }
-
-# =============================================================================
-# ИСПРАВЛЕНИЕ: fail2ban с правильным ignoreip (не банить свои IP)
-# =============================================================================
 ensure_fail2ban(){
   is_true "$ENABLE_FAIL2BAN" || { log "Skipping fail2ban (ENABLE_FAIL2BAN=0)"; return 0; }
   ensure_packages fail2ban
-
-  # Собираем список IP для ignoreip: 127.0.0.1 + SERVER_IP + PUBLIC_IPS + TRUSTED_SIP_SOURCES
-  local ignore_ips="127.0.0.1/8 ::1"
-  normalize_public_ips
-  local ip
-  for ip in $PUBLIC_IPS; do
-    ignore_ips+=" ${ip}"
-  done
-  if [[ -n "${TRUSTED_SIP_SOURCES:-}" ]]; then
-    local src
-    for src in $(normalize_list "$TRUSTED_SIP_SOURCES"); do
-      ignore_ips+=" ${src}"
-    done
-  fi
-
   local jail_file="/etc/fail2ban/jail.d/asterisk-pbx.conf"
-  local jail_content
-  jail_content="[DEFAULT]
-# ИСПРАВЛЕНИЕ: не банить собственные IP и доверенные источники
-ignoreip = ${ignore_ips}
-
-[asterisk]
+  local jail_content="[asterisk]
 enabled  = true
-port     = 5060,5061
+port     = 5060
 protocol = udp
 filter   = asterisk
 logpath  = /var/log/asterisk/messages.log
@@ -490,10 +439,9 @@ maxretry = 5
 findtime = 300
 bantime  = 86400
 backend  = auto
-
 [asterisk-tcp]
 enabled  = true
-port     = 5060,5061
+port     = 5060
 protocol = tcp
 filter   = asterisk
 logpath  = /var/log/asterisk/messages.log
@@ -501,27 +449,16 @@ maxretry = 5
 findtime = 300
 bantime  = 86400
 backend  = auto"
-
-  # Всегда перезаписываем — ignoreip может измениться при новых запусках
-  if is_true "$DRY_RUN"; then
-    log "DRY_RUN: would write $jail_file"
-  else
+  if [[ ! -f "$jail_file" ]] || ! grep -q "asterisk-pbx\|asterisk-tcp" "$jail_file" 2>/dev/null; then
     echo "$jail_content" > "$jail_file"
+    CHANGES+=("Fail2ban asterisk jail configured")
   fi
-  CHANGES+=("Fail2ban: jail configured (ignoreip=${ignore_ips})")
-
-  # Убеждаемся что asterisk пишет messages.log
   local ast_log="/etc/asterisk/logger.conf"
   if [[ -f "$ast_log" ]] && ! grep -q "^messages" "$ast_log"; then
-    if is_true "$DRY_RUN"; then
-      log "DRY_RUN: would append 'messages' to logger.conf"
-    else
-      echo "messages => notice,warning,error" >> "$ast_log"
-    fi
+    echo "messages => notice,warning,error" >> "$ast_log"
     NEED_ASTERISK_RESTART=1
     CHANGES+=("Asterisk logger: messages enabled")
   fi
-
   run_cmd "systemctl enable --now fail2ban >/dev/null 2>&1 || true"
   run_cmd "systemctl restart fail2ban >/dev/null 2>&1 || true"
   CHANGES+=("Fail2ban installed/enabled")
@@ -621,7 +558,6 @@ EOF
   apply_managed_block "$f" "TRUNK_GLOBALS" "$block" ";" && NEED_DIALPLAN_RELOAD=1 || true
   ensure_owner_mode "$f" asterisk:asterisk 0644
 }
-
 ensure_asterisk_configs(){
   local pjsip=/etc/asterisk/pjsip.conf
   local trunks_file=/etc/asterisk/pjsip_trunks.conf
@@ -632,8 +568,6 @@ ensure_asterisk_configs(){
   [[ -f "$users_file" ]]  || { run_cmd "touch \"$users_file\"";  CHANGES+=("Created: $users_file"); }
   [[ -f "$exts" ]]        || { run_cmd "touch \"$exts\"";        CHANGES+=("Created: $exts"); }
   validate_public_ips
-
-  # ── Транспорты ──────────────────────────────────────────────────────────────
   local transports_block=""
   transports_block+="[transport-udp-public]"$'\n'
   transports_block+="type=transport"$'\n'
@@ -664,7 +598,6 @@ ensure_asterisk_configs(){
   if apply_managed_block "$pjsip" "TRANSPORTS" "$transports_block" ";"; then
     NEED_PJSIP_RELOAD=1; NEED_ASTERISK_RESTART=1
   fi
-
   local include_block
   include_block="$(cat <<'EOF'
 ; Installer keeps trunks/users in separate files:
@@ -674,12 +607,9 @@ EOF
 )"
   apply_managed_block "$pjsip" "INCLUDES" "$include_block" ";" && NEED_PJSIP_RELOAD=1 || true
   ensure_owner_mode "$pjsip" asterisk:asterisk 0644
-
   local trunk_list user_list
   trunk_list="$(normalize_list "$TRUNKS")"
   user_list="$(normalize_list "$USERS")"
-
-  # ── Транки ──────────────────────────────────────────────────────────────────
   local t
   for t in $trunk_list; do
     local up proxy port matches outcid context bind_ip trunk_transport
@@ -729,6 +659,7 @@ disallow=all
 allow=ulaw
 allow=alaw
 aors=${t}
+outbound_proxy=sip:${proxy}:${port}\;lr
 from_domain=${proxy}
 ${from_user_line}
 send_pai=yes
@@ -747,21 +678,15 @@ EOF
     apply_managed_block "$trunks_file" "TRUNK_${t}" "$trunk_block" ";" && NEED_PJSIP_RELOAD=1 || true
   done
   ensure_owner_mode "$trunks_file" asterisk:asterisk 0644
-
-  # ── Пользователи ────────────────────────────────────────────────────────────
-  # ИСПРАВЛЕНИЕ: max_contacts=2, remove_existing=no — два устройства на аккаунт
   local u
   for u in $user_list; do
     [[ "$u" =~ ^[0-9]+$ ]] || die "User '${u}' must be numeric extension"
     local pass; pass="$(get_var "USER_${u}_PASS")"
     [[ -n "$pass" ]] || die "Missing USER_${u}_PASS for user '${u}'"
     local maxc remove_existing
-    maxc="$(get_var "USER_${u}_MAX_CONTACTS")"
-    [[ -n "$maxc" ]] || maxc="$DEFAULT_MAX_CONTACTS"
+    maxc="$(get_var "USER_${u}_MAX_CONTACTS")"; [[ -n "$maxc" ]] || maxc="$DEFAULT_MAX_CONTACTS"
     [[ "$maxc" =~ ^[0-9]+$ ]] || die "USER_${u}_MAX_CONTACTS must be numeric"
-    remove_existing="$(get_var "USER_${u}_REMOVE_EXISTING")"
-    [[ -n "$remove_existing" ]] || remove_existing="$DEFAULT_REMOVE_EXISTING"
-
+    remove_existing="$(get_var "USER_${u}_REMOVE_EXISTING")"; [[ -n "$remove_existing" ]] || remove_existing="$DEFAULT_REMOVE_EXISTING"
     local user_block
     user_block="$(cat <<EOF
 ; ===== LOCAL SIP USER ${u} =====
@@ -778,9 +703,6 @@ rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
 direct_media=no
-; ИСПРАВЛЕНИЕ: таймаут RTP — зависшие каналы сами упадут через 60с
-rtp_timeout=60
-rtp_timeout_hold=300
 [${u}]
 type=auth
 auth_type=userpass
@@ -788,29 +710,19 @@ username=${u}
 password=${pass}
 [${u}]
 type=aor
-; ИСПРАВЛЕНИЕ: 2 контакта — 2 устройства одновременно, без выбивания
 max_contacts=${maxc}
 remove_existing=${remove_existing}
-qualify_frequency=30
+qualify_frequency=0
 EOF
 )"
     apply_managed_block "$users_file" "USER_${u}" "$user_block" ";" && NEED_PJSIP_RELOAD=1 || true
   done
   ensure_owner_mode "$users_file" asterisk:asterisk 0644
-
-  # ── Диалплан ────────────────────────────────────────────────────────────────
-  # ИСПРАВЛЕНИЕ: внутренние звонки с обработкой статуса вместо голого Dial
   local internal_dials=""
   for u in $user_list; do
-    internal_dials+="exten => ${u},1,Dial(PJSIP/${u},${DIAL_TIMEOUT})"$'\n'
-    internal_dials+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"BUSY\"]?busy)"$'\n'
-    internal_dials+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"CONGESTION\"]?congestion)"$'\n'
-    internal_dials+=" same => n,Playback(vm-nobodyavail)"$'\n'
+    internal_dials+="exten => ${u},1,Dial(PJSIP/${u},30)"$'\n'
     internal_dials+=" same => n,Hangup()"$'\n'
-    internal_dials+=" same => n(busy),Busy()"$'\n'
-    internal_dials+=" same => n(congestion),Congestion()"$'\n'
   done
-
   local per_user_contexts=""
   for u in $user_list; do
     local trunk outcid
@@ -829,30 +741,16 @@ EOF
         [[ -n "$trunk_outcid" ]] && cid_set=" same => n,Set(CALLERID(all)=${trunk_outcid})"$'\n'
       fi
     fi
-
     per_user_contexts+=$'\n'"[from-internal-${u}]"$'\n'
     per_user_contexts+=$internal_dials$'\n'
-    # ИСПРАВЛЕНИЕ: исходящий звонок с обработкой DIALSTATUS — нет 500
     per_user_contexts+="exten => _7XXXXXXXXXX,1,NoOp(Outgoing via ${noop_trunk} for ${u})"$'\n'
     per_user_contexts+="${cid_set}"
     if is_true "$ENABLE_RECORDING"; then
-      per_user_contexts+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-out-${u}.wav,,/usr/bin/lame -b 64 ^{MONITOR_FILENAME} ^{MONITOR_FILENAME:0:-4}.mp3 && rm -f ^{MONITOR_FILENAME})"$'\n'
+      per_user_contexts+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-out-${u}.wav,b,/usr/bin/lame -b 64 \${MONITOR_FILENAME} \${MONITOR_FILENAME:0:-4}.mp3 && rm -f \${MONITOR_FILENAME})"$'\n'
     fi
-    per_user_contexts+=" same => n,Dial(${dial_target},${DIAL_TIMEOUT})"$'\n'
-    # ИСПРАВЛЕНИЕ: обработка всех возможных статусов после Dial
-    per_user_contexts+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"BUSY\"]?busy)"$'\n'
-    per_user_contexts+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"CONGESTION\"]?congestion)"$'\n'
-    per_user_contexts+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"CHANUNAVAIL\"]?unavail)"$'\n'
-    per_user_contexts+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"NOANSWER\"]?noanswer)"$'\n'
-    per_user_contexts+=" same => n,Playback(all-circuits-busy-now)"$'\n'
+    per_user_contexts+=" same => n,Dial(${dial_target},60)"$'\n'
     per_user_contexts+=" same => n,Hangup()"$'\n'
-    per_user_contexts+=" same => n(busy),Busy()"$'\n'
-    per_user_contexts+=" same => n(congestion),Congestion()"$'\n'
-    per_user_contexts+=" same => n(unavail),Playback(all-circuits-busy-now)"$'\n'
-    per_user_contexts+=" same => n,Hangup()"$'\n'
-    per_user_contexts+=" same => n(noanswer),Hangup()"$'\n'
   done
-
   local incoming_ctxs="" first_user
   first_user="$(echo "$user_list" | awk '{print $1}')"
   for t in $trunk_list; do
@@ -861,16 +759,11 @@ EOF
     incoming_ctxs+=$'\n'"[${ctx}]"$'\n'
     incoming_ctxs+="exten => _X.,1,NoOp(Incoming from trunk ${t})"$'\n'
     if is_true "$ENABLE_RECORDING"; then
-      incoming_ctxs+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-in.wav,,/usr/bin/lame -b 64 ^{MONITOR_FILENAME} ^{MONITOR_FILENAME:0:-4}.mp3 && rm -f ^{MONITOR_FILENAME})"$'\n'
+      incoming_ctxs+=" same => n,MixMonitor(/var/spool/asterisk/monitor/\${STRFTIME(\${EPOCH},,\%Y\%m\%d-\%H\%M\%S)}-\${EXTEN}-in.wav,b,/usr/bin/lame -b 64 \${MONITOR_FILENAME} \${MONITOR_FILENAME:0:-4}.mp3 && rm -f \${MONITOR_FILENAME})"$'\n'
     fi
-    # ИСПРАВЛЕНИЕ: входящий — тоже с обработкой статуса
-    incoming_ctxs+=" same => n,Dial(PJSIP/${first_user},${DIAL_TIMEOUT})"$'\n'
-    incoming_ctxs+=" same => n,GotoIf(\$[\"\${DIALSTATUS}\" = \"BUSY\"]?busy)"$'\n'
-    incoming_ctxs+=" same => n,Playback(vm-nobodyavail)"$'\n'
+    incoming_ctxs+=" same => n,Dial(PJSIP/${first_user},60)"$'\n'
     incoming_ctxs+=" same => n,Hangup()"$'\n'
-    incoming_ctxs+=" same => n(busy),Busy()"$'\n'
   done
-
   local dialplan_block
   dialplan_block="$(cat <<EOF
 #include "trunk_active.conf"
@@ -944,7 +837,6 @@ save_config_file(){
   block+=$'\n'
   env_append block DEFAULT_MAX_CONTACTS    "$DEFAULT_MAX_CONTACTS"
   env_append block DEFAULT_REMOVE_EXISTING "$DEFAULT_REMOVE_EXISTING"
-  env_append block DIAL_TIMEOUT            "$DIAL_TIMEOUT"
   block+=$'\n'
   env_append block OUTCID       "$OUTCID"
   env_append block EXOLVE_NAME  "$EXOLVE_NAME"
@@ -1016,8 +908,6 @@ health_checks(){
   if asterisk_is_active; then
     log "Asterisk is active."
     run_cmd "asterisk -rx \"pjsip show transports\" || true"
-    # ИСПРАВЛЕНИЕ: показываем контакты — видно сколько устройств зарегистрировано
-    run_cmd "asterisk -rx \"pjsip show contacts\" || true"
   else
     warn "Asterisk is not active. Check: journalctl -u asterisk -n 200 --no-pager"
   fi
@@ -1032,13 +922,9 @@ print_summary(){
   echo "SERVER_IP: ${SERVER_IP}"
   local u
   for u in $users; do
-    local mc re
-    mc="$(get_var "USER_${u}_MAX_CONTACTS")"; [[ -n "$mc" ]] || mc="$DEFAULT_MAX_CONTACTS"
-    re="$(get_var "USER_${u}_REMOVE_EXISTING")"; [[ -n "$re" ]] || re="$DEFAULT_REMOVE_EXISTING"
-    echo "  SIP: Server=${SERVER_IP}  User=${u}  Pass=$(get_var "USER_${u}_PASS")  MaxDevices=${mc}  RemoveExisting=${re}"
+    echo "  SIP: Server=${SERVER_IP}  User=${u}  Pass=$(get_var "USER_${u}_PASS")"
   done
   echo "Транки: ${trunks}"
-  echo "DIAL_TIMEOUT: ${DIAL_TIMEOUT}с"
   if [[ "${#CHANGES[@]}" -eq 0 ]]; then echo "Changes: none."; else
     echo "Changes:"; local c; for c in "${CHANGES[@]}"; do echo "  - ${c}"; done; fi
   echo "============================================================"
@@ -1046,11 +932,9 @@ print_summary(){
 validate_inputs(){
   detect_ip; validate_public_ips; validate_trusted_sources
   [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH_PORT must be numeric."
-  [[ -n "${DEFAULT_MAX_CONTACTS:-}" ]]    || { set_var DEFAULT_MAX_CONTACTS "2";   NEED_SAVE_CONFIG=1; }
+  [[ -n "${DEFAULT_MAX_CONTACTS:-}" ]]    || { set_var DEFAULT_MAX_CONTACTS "1";   NEED_SAVE_CONFIG=1; }
   [[ "${DEFAULT_MAX_CONTACTS}" =~ ^[0-9]+$ ]] || die "DEFAULT_MAX_CONTACTS must be numeric"
-  [[ -n "${DEFAULT_REMOVE_EXISTING:-}" ]] || { set_var DEFAULT_REMOVE_EXISTING "no"; NEED_SAVE_CONFIG=1; }
-  [[ -n "${DIAL_TIMEOUT:-}" ]] || { set_var DIAL_TIMEOUT "60"; NEED_SAVE_CONFIG=1; }
-  [[ "${DIAL_TIMEOUT}" =~ ^[0-9]+$ ]] || die "DIAL_TIMEOUT must be numeric"
+  [[ -n "${DEFAULT_REMOVE_EXISTING:-}" ]] || { set_var DEFAULT_REMOVE_EXISTING "yes"; NEED_SAVE_CONFIG=1; }
   local trunk_list user_list
   trunk_list="$(normalize_list "$TRUNKS")"; user_list="$(normalize_list "$USERS")"
   [[ -n "$trunk_list" ]] || die "TRUNKS is empty"
@@ -1081,7 +965,7 @@ validate_inputs(){
 main_apply(){
   need_root; detect_os; load_config_file; migrate_legacy_exolve; validate_inputs
   ensure_asterisk_installed; ensure_user_and_dirs; ensure_systemd_unit
-  ensure_logger; ensure_ufw_rules; ensure_asterisk_configs; ensure_tools; ensure_fail2ban; ensure_recording; ensure_balance_check
+  ensure_ufw_rules; ensure_asterisk_configs; ensure_tools; ensure_fail2ban; ensure_recording; ensure_balance_check
   if [[ "$NEED_SAVE_CONFIG" -eq 1 || ! -f "$CONFIG_FILE" ]]; then save_config_file; fi
   reload_or_restart_if_needed; health_checks; print_summary
 }
